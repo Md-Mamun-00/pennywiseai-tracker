@@ -81,12 +81,23 @@ android {
             // unlocked, tip-jar instead of Pro). Beats matching BuildConfig.FLAVOR
             // against the "fdroid" string literal, which a typo would silently break.
             buildConfigField("boolean", "IS_FDROID_BUILD", "true")
+            // No image share intent-filter (no ML Kit OCR)
+            manifestPlaceholders["imageIntentFilter"] = ""
         }
         create("standard") {
             dimension = "version"
             isDefault = true
             // Standard flavor includes all architectures (including x86 for emulators)
             buildConfigField("boolean", "IS_FDROID_BUILD", "false")
+            // Image share intent-filter: only in standard flavor (F-Droid has no ML Kit)
+            manifestPlaceholders["imageIntentFilter"] =
+                """
+                    <intent-filter>
+                        <action android:name="android.intent.action.SEND" />
+                        <category android:name="android.intent.category.DEFAULT" />
+                        <data android:mimeType="image/*" />
+                    </intent-filter>
+                """.trimIndent()
         }
     }
 
@@ -345,6 +356,8 @@ dependencies {
     // coroutines >= 1.11.0 provides it (see the litertlm note in libs.versions.toml, #599).
     implementation(libs.kotlinx.coroutines.core)
     implementation(libs.kotlinx.coroutines.android)
+    // ML Kit Task.await() integration
+    implementation(libs.kotlinx.coroutines.play.services)
     // LiteRT-LM for on-device LLM inference
     implementation(libs.litertlm.android)
 
@@ -353,6 +366,12 @@ dependencies {
 
     // Google Play In-App Reviews (only for standard flavor)
     "standardImplementation"(libs.review)
+
+    // OCR for the image import (standard flavor only): ML Kit's bundled Latin text
+    // recognizer, fully on-device. Its POM drags in Play Services AARs and the
+    // ToS-licensed model, which the F-Droid flavor must not ship — app/src/fdroid
+    // binds an unavailable stub instead (di/OcrModule.kt).
+    "standardImplementation"(libs.mlkit.text.recognition)
 
     testImplementation(libs.mockk)
     testImplementation(libs.kotlinx.coroutines.test)

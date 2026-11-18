@@ -86,6 +86,11 @@ class MainActivity : FragmentActivity() {
     var sharedText by mutableStateOf<String?>(null)
         private set
 
+    // An image shared to PennyWise (a receipt or payment screenshot): the Add
+    // form reads its words on-device and fills in what they state.
+    var sharedImage by mutableStateOf<String?>(null)
+        private set
+
     // A question said to the quick add mic (its words wait in ChatDraftInbox): when it was asked.
     var openChat by mutableStateOf<Long?>(null)
         private set
@@ -126,6 +131,7 @@ class MainActivity : FragmentActivity() {
         val editCompleteCallback = { editTransactionId = null }
         val addShortcutCallback = { openAddTransaction = null }
         val sharedTextCallback = { sharedText = null }
+        val sharedImageCallback = { sharedImage = null }
 
         // A binder call to the system on every launch; nothing on screen waits for it.
         lifecycleScope.launch(kotlinx.coroutines.Dispatchers.Default) { registerQuickAddShortcut() }
@@ -138,6 +144,8 @@ class MainActivity : FragmentActivity() {
                 onAddTransactionShortcutHandled = addShortcutCallback,
                 sharedText = sharedText,
                 onSharedTextHandled = sharedTextCallback,
+                sharedImage = sharedImage,
+                onSharedImageHandled = sharedImageCallback,
                 widgetDestination = widgetDestination,
                 onWidgetDestinationHandled = { widgetDestination = null },
                 openChat = openChat,
@@ -170,8 +178,8 @@ class MainActivity : FragmentActivity() {
         super.onSaveInstanceState(outState)
         outState.putBoolean(
             KEY_LAUNCH_PENDING,
-            editTransactionId != null || openAddTransaction != null || sharedText != null || widgetDestination != null ||
-                openChat != null
+            editTransactionId != null || openAddTransaction != null || sharedText != null || sharedImage != null ||
+                widgetDestination != null || openChat != null
         )
     }
 
@@ -217,6 +225,16 @@ class MainActivity : FragmentActivity() {
         if (intent?.action == Intent.ACTION_SEND && intent.type == "text/plain") {
             // Capped: it travels as a navigation argument and ends up as a note.
             sharedText = intent.getStringExtra(Intent.EXTRA_TEXT)?.trim()?.take(MAX_SHARED_TEXT)?.ifEmpty { null }
+        }
+        if (intent?.action == Intent.ACTION_SEND && intent.type?.startsWith("image/") == true) {
+            // Kept as a string: it travels as a navigation argument like sharedText.
+            val uri = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                intent.getParcelableExtra(Intent.EXTRA_STREAM, Uri::class.java)
+            } else {
+                @Suppress("DEPRECATION")
+                intent.getParcelableExtra(Intent.EXTRA_STREAM)
+            }
+            sharedImage = uri?.toString()
         }
         intent?.getStringExtra(EXTRA_CHAT_TEXT)?.take(MAX_SHARED_TEXT)?.let {
             chatDrafts.put(it)

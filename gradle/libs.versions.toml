@@ -19,6 +19,9 @@ ktorVersion = "3.6.1"
 lifecycle = "2.11.0"
 activityCompose = "1.13.0"
 composeBom = "2026.09.00"
+# Bundled (on-device, offline) OCR for the image import; standard flavor only —
+# its POM pulls Play Services and ML Kit ToS-licensed model code (see app/build.gradle.kts).
+mlkitTextRecognition = "16.0.1"
 mockk = "1.14.11"
 # Konsist bundles kotlin-compiler-embeddable: keep it on a release built against
 # the project's Kotlin version (0.18.1 targets Kotlin 2.4.21).
@@ -40,6 +43,8 @@ sqliteVersion = "2.7.1"
 # read: chat passes QwenChatTemplate instead (LlmServiceImpl).
 litertlm = "0.19.0"
 coroutines = "1.11.0"
+# ML Kit Tasks need coroutines integration for await()
+coroutinesPlayServices = "1.11.0"
 benchmark = "1.5.0"
 uiautomator = "2.4.1"
 profileinstaller = "1.4.1"
@@ -62,6 +67,7 @@ kover = "0.9.11"
 leakcanary-android = { module = "com.squareup.leakcanary:leakcanary-android", version.ref = "leakcanary" }
 coil-compose = { module = "io.coil-kt.coil3:coil-compose", version.ref = "coil" }
 zxing-core = { module = "com.google.zxing:core", version.ref = "zxing" }
+mlkit-text-recognition = { module = "com.google.mlkit:text-recognition", version.ref = "mlkitTextRecognition" }
 androidx-benchmark-macro-junit4 = { module = "androidx.benchmark:benchmark-macro-junit4", version.ref = "benchmark" }
 androidx-profileinstaller = { module = "androidx.profileinstaller:profileinstaller", version.ref = "profileinstaller" }
 androidx-uiautomator = { module = "androidx.test.uiautomator:uiautomator", version.ref = "uiautomator" }
@@ -107,6 +113,7 @@ androidx-ui-test-junit4 = { group = "androidx.compose.ui", name = "ui-test-junit
 androidx-material3 = { group = "androidx.compose.material3", name = "material3", version.ref = "material3" }
 kotlinx-coroutines-core = { module = "org.jetbrains.kotlinx:kotlinx-coroutines-core", version.ref = "coroutines" }
 kotlinx-coroutines-android = { module = "org.jetbrains.kotlinx:kotlinx-coroutines-android", version.ref = "coroutines" }
+kotlinx-coroutines-play-services = { module = "org.jetbrains.kotlinx:kotlinx-coroutines-play-services", version.ref = "coroutinesPlayServices" }
 kotlinx-coroutines-test = { module = "org.jetbrains.kotlinx:kotlinx-coroutines-test", version.ref = "coroutines" }
 kotlinx-serialization-json = { module = "org.jetbrains.kotlinx:kotlinx-serialization-json", version.ref = "kotlinxSerializationJson" }
 ktor-client-content-negotiation = { module = "io.ktor:ktor-client-content-negotiation", version.ref = "ktorVersion" }

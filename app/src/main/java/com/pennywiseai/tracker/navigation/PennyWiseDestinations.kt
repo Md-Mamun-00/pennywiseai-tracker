@@ -64,6 +64,8 @@ data class TransactionDetail(val transactionId: Long) : NavKey
 data class AddTransaction(
     val sourceTransactionId: Long? = null,
     val sharedText: String? = null,
+    // An image shared into the app (a receipt or payment screenshot), read on-device.
+    val sharedImage: String? = null,
     // The quick add sheet's draft ("More details"): what was typed there.
     val amount: String? = null,
     val merchant: String? = null,

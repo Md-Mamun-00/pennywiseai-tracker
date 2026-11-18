@@ -50,6 +50,8 @@ fun PennyWiseApp(
     onAddTransactionShortcutHandled: (() -> Unit)? = null,
     sharedText: String? = null,
     onSharedTextHandled: (() -> Unit)? = null,
+    sharedImage: String? = null,
+    onSharedImageHandled: (() -> Unit)? = null,
     widgetDestination: NavKey? = null,
     onWidgetDestinationHandled: (() -> Unit)? = null,
     openChat: Long? = null,
@@ -160,6 +162,17 @@ fun PennyWiseApp(
     ) { text ->
         backStack.add(com.pennywiseai.tracker.navigation.AddTransaction(sharedText = text))
         onSharedTextHandled?.invoke()
+    }
+    NavigateWhenUnlocked(
+        request = sharedImage,
+        onboarded = themeUiState.hasCompletedOnboarding,
+        lock = appLockUiState,
+        currentRoute = currentRoute,
+        refreshLock = actualAppLockViewModel::refreshLockState,
+        showLockScreen = showLockScreen,
+    ) { image ->
+        backStack.add(com.pennywiseai.tracker.navigation.AddTransaction(sharedImage = image))
+        onSharedImageHandled?.invoke()
     }
     NavigateWhenUnlocked(
         request = widgetDestination,

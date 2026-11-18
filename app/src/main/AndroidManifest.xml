@@ -100,6 +100,8 @@
                 <category android:name="android.intent.category.BROWSABLE" />
                 <data android:scheme="pennywise" android:host="add" />
             </intent-filter>
+
+            ${imageIntentFilter}
         </activity>
 
         <!-- Translucent picker launched from the "More categories…" txn-alert
