@@ -45,6 +45,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.snapshotFlow
@@ -76,6 +77,7 @@ import com.pennywiseai.tracker.data.repository.CategoryRepository
 import com.pennywiseai.tracker.data.repository.ModelRepository
 import com.pennywiseai.tracker.data.repository.TransactionRepository
 import com.pennywiseai.tracker.domain.usecase.AddTransactionUseCase
+import com.pennywiseai.tracker.domain.usecase.ExtractTransactionUseCase
 import com.pennywiseai.tracker.navigation.BottomNavItem
 import com.pennywiseai.tracker.ui.components.CategoryChip
 import com.pennywiseai.tracker.ui.components.ConnectedChoiceRow
@@ -93,6 +95,7 @@ import com.pennywiseai.tracker.utils.CurrencyFormatter
 import com.pennywiseai.tracker.utils.withLatinDigits
 import com.pennywiseai.tracker.widget.WidgetRefresher
 import dagger.hilt.android.AndroidEntryPoint
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.first
@@ -128,6 +131,7 @@ import javax.inject.Inject
 class QuickAddActivity : FragmentActivity() {
 
     @Inject lateinit var addTransaction: AddTransactionUseCase
+    @Inject lateinit var extractTransaction: ExtractTransactionUseCase
     @Inject lateinit var categoryRepository: CategoryRepository
     @Inject lateinit var transactionRepository: TransactionRepository
     @Inject lateinit var accountBalanceRepository: AccountBalanceRepository
@@ -278,12 +282,39 @@ class QuickAddActivity : FragmentActivity() {
         // ones already routed or left by a recording that failed.
         var midRecording by rememberSaveable { mutableStateOf(false) }
         val categories = setup.expenseCategories + setup.incomeCategories
+        // The rules found no entry: the model gets one shot at the words first,
+        // so "unclear" is only what both of them couldn't read.
+        var thinking by remember { mutableStateOf(false) }
+        val scope = rememberCoroutineScope()
+        fun readWithModel(text: String) {
+            thinking = true
+            scope.launch {
+                val entry = try {
+                    extractTransaction(text)?.toVoiceEntry(categories, setup.baseCurrency)
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (e: Exception) {
+                    Log.w(TAG, "Voice extraction failed (${e.javaClass.simpleName})")
+                    null
+                }
+                thinking = false
+                if (entry != null) {
+                    onEntry(entry)
+                } else {
+                    unclear = true
+                }
+            }
+        }
         fun route(text: String) {
             midRecording = false
             when (val route = voiceRoute(text, categories, setup.baseCurrency, setup.chatOpen, setup.modelReady) { CategoryMapping.label(this, it) }) {
                 is VoiceRoute.Fill -> onEntry(route.entry)
                 VoiceRoute.Chat -> openChat(text)
-                VoiceRoute.Unclear -> unclear = true
+                VoiceRoute.Unclear -> if (setup.modelReady) {
+                    readWithModel(text)
+                } else {
+                    unclear = true
+                }
                 VoiceRoute.ChatHidden -> chatHidden = true
             }
         }
@@ -344,18 +375,33 @@ class QuickAddActivity : FragmentActivity() {
                 color = if (transcript.isEmpty()) MaterialTheme.colorScheme.onSurfaceVariant else MaterialTheme.colorScheme.onSurface,
                 modifier = Modifier.fillMaxWidth()
             )
-            if (unclear || chatHidden) {
-                Text(
+            when {
+                thinking -> Text(
+                    text = stringResource(R.string.quick_add_voice_reading),
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+                unclear || chatHidden -> Text(
                     text = stringResource(if (chatHidden) R.string.quick_add_voice_chat_hidden else R.string.quick_add_voice_unclear),
                     style = MaterialTheme.typography.bodyMedium,
                     color = MaterialTheme.colorScheme.error
                 )
             }
+            // Without the model these words can't be read here: Chat offers its download,
+            // with the words kept in the box for when it's ready.
+            if (unclear && !setup.modelReady && setup.chatOpen) {
+                TextButton(
+                    onClick = { openChat(transcript) },
+                    shapes = ButtonDefaults.shapes()
+                ) {
+                    Text(stringResource(R.string.quick_add_voice_model))
+                }
+            }
             Row(verticalAlignment = Alignment.CenterVertically) {
                 VoiceStatusBar(voice, Modifier.weight(1f))
                 VoiceMicButton(
                     voice = voice,
-                    enabled = true,
+                    enabled = !thinking,
                     onTap = {
                         unclear = false
                         chatHidden = false
