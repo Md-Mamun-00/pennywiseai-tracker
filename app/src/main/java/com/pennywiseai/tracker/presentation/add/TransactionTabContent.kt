@@ -52,6 +52,9 @@ import com.pennywiseai.tracker.ui.icons.categoryLabel
 import com.pennywiseai.tracker.ui.theme.*
 import com.pennywiseai.tracker.ui.theme.Spacing
 import com.pennywiseai.tracker.ui.theme.money
+import com.pennywiseai.tracker.ui.voice.VoiceMicButton
+import com.pennywiseai.tracker.ui.voice.VoiceStatusBar
+import com.pennywiseai.tracker.ui.voice.rememberVoiceInput
 import com.pennywiseai.tracker.utils.AppDates
 import com.pennywiseai.tracker.utils.CurrencyFormatter
 import java.time.format.DateTimeFormatter
@@ -177,6 +180,9 @@ fun TransactionTabContent(
     val focusManager = LocalFocusManager.current
     var showTimePicker by remember { mutableStateOf(false) }
     var showCategoryMenu by remember { mutableStateOf(false) }
+    // The mic: what it hears is read into the form by the on-device model when it stops.
+    val voice = rememberVoiceInput(onText = {}, onDone = { viewModel.importFromVoice(it) })
+    val voiceExtracting by viewModel.voiceExtracting.collectAsStateWithLifecycle()
     // Which account picker is open (null = closed). For a TRANSFER this routes the
     // chosen account to either the FROM or TO card; for other types only FROM is used.
     var accountPickerTarget by remember { mutableStateOf<AccountPickerTarget?>(null) }
@@ -243,6 +249,68 @@ fun TransactionTabContent(
                     shape = fullShape,
                     colors = filledFieldColors()
                 )
+
+                val importing by viewModel.imageImporting.collectAsStateWithLifecycle()
+
+                // Read a receipt or payment screenshot into the form: on-device OCR
+                // and rules first, the on-device model only when they find nothing.
+                if (viewModel.imageImportAvailable) {
+                    val importLauncher = rememberLauncherForActivityResult(
+                        contract = ActivityResultContracts.PickVisualMedia()
+                    ) { uri -> uri?.let(viewModel::importFromImage) }
+                    IconButton(
+                        onClick = {
+                            importLauncher.launch(
+                                PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly)
+                            )
+                        },
+                        enabled = !importing,
+                        modifier = Modifier.align(Alignment.CenterVertically)
+                    ) {
+                        if (importing) {
+                            CircularProgressIndicator(
+                                modifier = Modifier.size(20.dp),
+                                strokeWidth = 2.dp
+                            )
+                        } else {
+                            Icon(
+                                Icons.Default.Image,
+                                contentDescription = stringResource(R.string.add_import_image),
+                                tint = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
+                    }
+                }
+
+                // The mic: what it hears is read into the form by the on-device
+                // model when recording stops (which needs the model — it asks).
+                Box(modifier = Modifier.align(Alignment.CenterVertically)) {
+                    VoiceMicButton(
+                        voice = voice,
+                        enabled = !importing && !voiceExtracting,
+                        onTap = {
+                            if (voice.available) voice.toggle("") else viewModel.voiceUnavailable()
+                        }
+                    )
+                }
+            }
+
+            // What the last import or voice reading couldn't fill in, when it couldn't.
+            val importMessage by viewModel.importMessage.collectAsStateWithLifecycle()
+            val importStatus = when {
+                voiceExtracting -> stringResource(R.string.add_voice_reading)
+                else -> importMessage?.asString()
+            }
+            if (importStatus != null) {
+                Text(
+                    text = importStatus,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.fillMaxWidth()
+                )
+            }
+            if (voice.active || voice.note != null) {
+                VoiceStatusBar(voice)
             }
 
             // ── Merchant + Notes + Reference (connected cards) ──
@@ -724,6 +792,59 @@ fun TransactionTabContent(
         ) {
             DatePicker(state = datePickerState)
         }
+    }
+
+    // Voice parsing needs the model: offer the download here and hold the
+    // transcript for it (dismiss drops the transcript; the download carries on).
+    val voiceModelRequired by viewModel.voiceModelRequired.collectAsStateWithLifecycle()
+    if (voiceModelRequired) {
+        val downloadedMB by viewModel.voiceDownloadedMB.collectAsStateWithLifecycle()
+        val totalMB by viewModel.voiceTotalMB.collectAsStateWithLifecycle()
+        val downloadError by viewModel.voiceDownloadError.collectAsStateWithLifecycle()
+        AlertDialog(
+            onDismissRequest = viewModel::dismissVoiceModelRequired,
+            title = { Text(stringResource(R.string.chat_model_required_title)) },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(Spacing.sm)) {
+                    Text(stringResource(R.string.add_voice_model_body))
+                    Text(
+                        text = stringResource(R.string.chat_model_size_hint),
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                    if (downloadedMB > 0) {
+                        LinearProgressIndicator(
+                            progress = { if (totalMB > 0) downloadedMB.toFloat() / totalMB else 0f },
+                            modifier = Modifier.fillMaxWidth()
+                        )
+                        Text(
+                            text = stringResource(R.string.chat_download_progress, downloadedMB, totalMB),
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                    downloadError?.let { error ->
+                        Text(
+                            text = error.asString(),
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.error
+                        )
+                    }
+                }
+            },
+            confirmButton = {
+                TextButton(
+                    onClick = { viewModel.startVoiceModelDownload() },
+                    shapes = ButtonDefaults.shapes()
+                ) { Text(stringResource(R.string.chat_download)) }
+            },
+            dismissButton = {
+                TextButton(
+                    onClick = viewModel::dismissVoiceModelRequired,
+                    shapes = ButtonDefaults.shapes()
+                ) { Text(stringResource(R.string.chat_cancel)) }
+            }
+        )
     }
 
     // Time Picker Dialog

@@ -8,10 +8,14 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.pennywiseai.parser.core.GenericTransactionExtractor
 import com.pennywiseai.tracker.R
+import com.pennywiseai.tracker.core.Constants
 import com.pennywiseai.tracker.data.database.entity.AccountBalanceEntity
 import com.pennywiseai.tracker.data.database.entity.BudgetImpactType
 import com.pennywiseai.tracker.data.database.entity.SubscriptionState
 import com.pennywiseai.tracker.data.database.entity.TransactionType
+import com.pennywiseai.tracker.data.manager.ModelDownloader
+import com.pennywiseai.tracker.data.model.ExtractedTransaction
+import com.pennywiseai.tracker.data.model.ImageTextParser
 import com.pennywiseai.tracker.data.preferences.CurrencyPreferences
 import com.pennywiseai.tracker.data.preferences.LearnedSendersStore
 import com.pennywiseai.tracker.data.receipt.ReceiptManager
@@ -19,26 +23,39 @@ import com.pennywiseai.tracker.data.repository.AccountBalanceRepository
 import com.pennywiseai.tracker.data.repository.BudgetGroupRepository
 import com.pennywiseai.tracker.data.repository.CategoryRepository
 import com.pennywiseai.tracker.data.repository.MerchantMappingRepository
+import com.pennywiseai.tracker.data.repository.ModelRepository
+import com.pennywiseai.tracker.data.repository.ModelState
 import com.pennywiseai.tracker.data.repository.TagRepository
 import com.pennywiseai.tracker.data.repository.TransactionRepository
 import com.pennywiseai.tracker.data.repository.UnrecognizedSmsRepository
+import com.pennywiseai.tracker.domain.service.TextOcr
 import com.pennywiseai.tracker.domain.usecase.AddSubscriptionUseCase
 import com.pennywiseai.tracker.domain.usecase.AddTransactionUseCase
+import com.pennywiseai.tracker.domain.usecase.ExtractTransactionUseCase
 import com.pennywiseai.tracker.domain.usecase.GetCategoriesUseCase
 import com.pennywiseai.tracker.presentation.transactions.normalizeReference
 import com.pennywiseai.tracker.ui.UiText
 import com.pennywiseai.tracker.ui.components.pickerDefault
 import dagger.hilt.android.lifecycle.HiltViewModel
 import dagger.hilt.android.qualifiers.ApplicationContext
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import java.math.BigDecimal
 import java.time.Instant
 import java.time.LocalDate
 import java.time.LocalDateTime
 import java.time.ZoneId
 import javax.inject.Inject
+
+/** How much of an image's words or a voice transcript the note keeps: provenance, not a dump. */
+private const val MAX_IMPORT_NOTES = 400
+
+/** Same megabyte count Chat's download prompt shows. */
+private const val BYTES_PER_MB = 1024L * 1024L
 
 @HiltViewModel
 class AddViewModel @Inject constructor(
@@ -56,6 +73,10 @@ class AddViewModel @Inject constructor(
     private val receiptManager: ReceiptManager,
     private val unrecognizedSmsRepository: UnrecognizedSmsRepository,
     private val learnedSendersStore: LearnedSendersStore,
+    private val textOcr: TextOcr,
+    private val extractTransactionUseCase: ExtractTransactionUseCase,
+    private val modelRepository: ModelRepository,
+    private val modelDownloader: ModelDownloader,
     savedStateHandle: SavedStateHandle
 ) : ViewModel() {
 
@@ -70,6 +91,10 @@ class AddViewModel @Inject constructor(
     // Text shared into the app ("Share to PennyWise"): pre-fills the amount when
     // one is clear and keeps the full text as the note.
     private val sharedText: String? = savedStateHandle.get<String>("sharedText")
+
+    // An image shared into the app (a receipt or payment screenshot), read
+    // on-device into the same pre-filled draft as [sharedText].
+    private val sharedImage: String? = savedStateHandle.get<String>("sharedImage")
 
     // The quick add sheet's "More details": what was typed there, account included.
     private val draftAmount: String? = savedStateHandle.get<String>("amount")
@@ -93,6 +118,53 @@ class AddViewModel @Inject constructor(
     // Transaction Tab State
     private val _transactionUiState = MutableStateFlow(TransactionUiState())
     val transactionUiState: StateFlow<TransactionUiState> = _transactionUiState.asStateFlow()
+
+    /** Whether this build can read an image at all — the F-Droid flavor can't (no ML Kit). */
+    val imageImportAvailable: Boolean = textOcr.isAvailable
+
+    private val _imageImporting = MutableStateFlow(false)
+    /** While an image's words are being read: the import control shows progress. */
+    val imageImporting: StateFlow<Boolean> = _imageImporting.asStateFlow()
+
+    // Why the last import couldn't fill the form — shown under the amount row.
+    // (TransactionUiState.error is never rendered in this tab, so this has its own.)
+    private val _importMessage = MutableStateFlow<UiText?>(null)
+    val importMessage: StateFlow<UiText?> = _importMessage.asStateFlow()
+
+    // ── Voice: what the mic heard, read by the on-device model ──
+
+    private val _voiceExtracting = MutableStateFlow(false)
+    /** While the transcript is being read: the mic shows progress. */
+    val voiceExtracting: StateFlow<Boolean> = _voiceExtracting.asStateFlow()
+
+    // The transcript waits in [pendingVoice] while the model-required prompt is up.
+    private val _voiceModelRequired = MutableStateFlow(false)
+    val voiceModelRequired: StateFlow<Boolean> = _voiceModelRequired.asStateFlow()
+
+    /** The prompt's progress and failures, from the downloader Chat also drives. */
+    val voiceDownloadedMB: StateFlow<Long> = modelDownloader.progress
+        .map { it.downloadedBytes / BYTES_PER_MB }
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), 0L)
+
+    val voiceTotalMB: StateFlow<Long> = modelDownloader.progress
+        .map { it.totalBytes / BYTES_PER_MB }
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), Constants.ModelDownload.MODEL_SIZE_MB)
+
+    val voiceDownloadError: StateFlow<UiText?> = modelDownloader.progress
+        .map { p ->
+            when (p.failure) {
+                ModelDownloader.Failure.NO_SPACE -> UiText.Res(R.string.chat_error_no_storage)
+                ModelDownloader.Failure.NETWORK -> UiText.Res(R.string.chat_error_download_failed)
+                ModelDownloader.Failure.INTEGRITY -> UiText.Res(R.string.chat_error_integrity_failed)
+                ModelDownloader.Failure.ROAMING -> UiText.Res(R.string.chat_error_download_roaming)
+                null -> null
+            }
+        }
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), null)
+
+    // The transcript held while the model downloads, and the job waiting for it.
+    private var pendingVoice: String? = null
+    private var modelWatchJob: Job? = null
 
     // Subscription Tab State
     private val _subscriptionUiState = MutableStateFlow(SubscriptionUiState())
@@ -131,6 +203,7 @@ class AddViewModel @Inject constructor(
                     )
                 }
             }
+            sharedImage?.let { importFromImage(Uri.parse(it)) }
             draftType?.let { updateTransactionType(it) }
             _transactionUiState.update {
                 it.copy(
@@ -175,6 +248,154 @@ class AddViewModel @Inject constructor(
         }
 
         selectAccount(source.bankName, source.accountNumber?.takeLast(4))
+    }
+
+    /**
+     * Reads [uri] on-device into the form: the bundled OCR words go through the
+     * receipt/screenshot rules first, and only when they find no amount does the
+     * on-device model get a try (skipped entirely when it isn't downloaded).
+     * Nothing is saved until the user taps Save. A failure or an image that
+     * states no amount lands in the form's error line — the form still works.
+     */
+    fun importFromImage(uri: Uri) {
+        if (_imageImporting.value) return
+        viewModelScope.launch {
+            _imageImporting.value = true
+            _importMessage.value = null
+            try {
+                val words = withContext(Dispatchers.IO) { textOcr.recognize(uri) }
+                if (words == null) {
+                    _importMessage.value = UiText.Res(R.string.add_import_failed)
+                    return@launch
+                }
+                val extracted = ImageTextParser.parse(words) ?: extractTransactionUseCase(words)
+                if (extracted == null) {
+                    _importMessage.value = UiText.Res(R.string.add_import_none)
+                } else {
+                    applyExtracted(extracted, words)
+                }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                Log.w("AddViewModel", "Image import failed (${e.javaClass.simpleName})")
+                _importMessage.value = UiText.Res(R.string.add_import_failed)
+            } finally {
+                _imageImporting.value = false
+            }
+        }
+    }
+
+    /**
+     * Fills the form from what [extracted] states — by image rules or by the
+     * one-shot model turn (voice uses this too). Evidence fills only what the
+     * user hasn't filled in: a typed amount/merchant/notes stands, a chosen
+     * category stands, a date that has been moved off today stands. The type is
+     * applied first when the text says it, so the category lists match it.
+     */
+    private suspend fun applyExtracted(extracted: ExtractedTransaction, source: String?) {
+        extracted.type?.let { updateTransactionType(it) }
+        val state = _transactionUiState.value
+        val amount = extracted.amount
+        if (amount != null && state.amount.isBlank() &&
+            (extracted.currency == null || extracted.currency == state.currency)
+        ) {
+            updateTransactionAmount(amount.stripTrailingZeros().toPlainString())
+        }
+        if (!extracted.merchant.isNullOrBlank() && state.merchant.isBlank()) {
+            updateTransactionMerchant(extracted.merchant!!)
+        }
+        extracted.category?.let { wanted ->
+            val type = extracted.type ?: state.transactionType
+            val available = if (type == TransactionType.INCOME) {
+                categoryRepository.getVisibleIncomeCategories().first()
+            } else {
+                categoryRepository.getVisibleExpenseCategories().first()
+            }
+            val name = ExtractedTransaction.matchCategory(available, wanted, type)
+            val current = _transactionUiState.value.category
+            if (name != null && (current.isBlank() || current in DEFAULT_CATEGORY_PLACEHOLDERS)) {
+                updateTransactionCategory(name)
+            }
+        }
+        extracted.daysAgo?.let { days ->
+            // Only while the form is still on its default (today): a date the
+            // user picked themselves isn't a blank field for evidence to fill.
+            if (_transactionUiState.value.date.toLocalDate() == LocalDate.now()) {
+                val picked = LocalDate.now().minusDays(days.toLong())
+                updateTransactionDate(picked.atStartOfDay(ZoneId.systemDefault()).toInstant().toEpochMilli())
+            }
+        }
+        val notes = _transactionUiState.value.notes
+        if (!source.isNullOrBlank() && notes.isBlank()) {
+            updateTransactionNotes(source.trim().take(MAX_IMPORT_NOTES))
+        }
+    }
+
+    /**
+     * What the mic heard: the on-device model reads it into the form in a
+     * one-shot turn that never touches chat history. Voice parsing needs the
+     * model, so a missing one raises the download prompt and the transcript
+     * waits for it ([pendingVoice]) instead of being dropped.
+     */
+    fun importFromVoice(text: String) {
+        val heard = text.trim()
+        if (heard.isBlank()) return
+        viewModelScope.launch {
+            if (!withContext(Dispatchers.IO) { modelRepository.isModelDownloaded() }) {
+                pendingVoice = heard
+                _voiceModelRequired.value = true
+                watchForModel()
+                return@launch
+            }
+            extractVoice(heard)
+        }
+    }
+
+    /** The device has no speech recognizer: say so rather than leave a dead mic. */
+    fun voiceUnavailable() {
+        _importMessage.value = UiText.Res(R.string.add_voice_unavailable)
+    }
+
+    fun startVoiceModelDownload() = modelDownloader.start()
+
+    /** Close the prompt: the held transcript is dropped; the download carries on. */
+    fun dismissVoiceModelRequired() {
+        _voiceModelRequired.value = false
+        pendingVoice = null
+        modelWatchJob?.cancel()
+        modelWatchJob = null
+    }
+
+    /** Waits for the model download to pass its hash check, then reads [pendingVoice]. */
+    private fun watchForModel() {
+        if (modelWatchJob?.isActive == true) return
+        modelWatchJob = viewModelScope.launch {
+            // The downloader moves the state to READY once the file passes its hash check.
+            modelRepository.modelState.first { it == ModelState.READY }
+            _voiceModelRequired.value = false
+            val heard = pendingVoice ?: return@launch
+            pendingVoice = null
+            extractVoice(heard)
+        }
+    }
+
+    private suspend fun extractVoice(heard: String) {
+        _voiceExtracting.value = true
+        try {
+            val extracted = extractTransactionUseCase(heard)
+            if (extracted == null) {
+                _importMessage.value = UiText.Res(R.string.add_voice_none)
+            } else {
+                applyExtracted(extracted, heard)
+            }
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            Log.w("AddViewModel", "Voice extraction failed (${e.javaClass.simpleName})")
+            _importMessage.value = UiText.Res(R.string.add_voice_failed)
+        } finally {
+            _voiceExtracting.value = false
+        }
     }
 
     /**

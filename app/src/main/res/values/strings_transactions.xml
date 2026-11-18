@@ -297,6 +297,15 @@
     <string name="add_receipt_remove">Remove receipt</string>
     <string name="add_receipt_gallery">Gallery</string>
     <string name="add_receipt_camera">Camera</string>
+    <string name="add_import_image">Read from image</string>
+    <string name="add_import_reading">Reading image…</string>
+    <string name="add_import_failed">Couldn\'t read that image</string>
+    <string name="add_import_none">No amount found in that image — fill the form below</string>
+    <string name="add_voice_none">Couldn\'t find an amount in what you said — fill the form below</string>
+    <string name="add_voice_failed">Couldn\'t read what you said</string>
+    <string name="add_voice_unavailable">Voice input isn\'t available on this device</string>
+    <string name="add_voice_reading">Reading what you said…</string>
+    <string name="add_voice_model_body">Download the AI model to read what you said. Everything stays on this device.</string>
     <string name="add_sub_direction_expense">Expense</string>
     <string name="add_sub_direction_income">Income</string>
     <string name="add_sub_info_income">Track recurring income (wallet top-ups, allowance). A transaction is auto-created on each scheduled date.</string>
@@ -455,6 +464,8 @@
     <string name="quick_add_voice_title">Add by voice</string>
     <string name="quick_add_voice_hint">Say a cash spend like “200 lunch”, or ask a question.</string>
     <string name="quick_add_voice_unclear">Couldn\'t find one amount in that. Try again, or type it.</string>
+    <string name="quick_add_voice_reading">Reading what you said…</string>
+    <string name="quick_add_voice_model">Ask PennyWise AI</string>
     <string name="quick_add_voice_chat_hidden">Questions go to Chat, which is hidden. Show it in Appearance settings, or say a spend.</string>
     <string name="quick_add_voice_type">Type instead</string>
     <string name="date_range_title">Select Date Range</string>
