@@ -2,42 +2,43 @@ package com.pennywiseai.tracker.data.service
 
 import android.content.Context
 import android.util.Log
+import com.google.ai.edge.litertlm.Backend
+import com.google.ai.edge.litertlm.Contents
 import com.google.ai.edge.litertlm.Conversation
 import com.google.ai.edge.litertlm.ConversationConfig
-import com.google.ai.edge.litertlm.Contents
 import com.google.ai.edge.litertlm.Engine
 import com.google.ai.edge.litertlm.EngineConfig
 import com.google.ai.edge.litertlm.Message
 import com.google.ai.edge.litertlm.MessageCallback
+import com.google.ai.edge.litertlm.ResponseFormat
 import com.google.ai.edge.litertlm.SamplerConfig
-import com.google.ai.edge.litertlm.Backend
 import com.google.ai.edge.litertlm.tool
 import com.pennywiseai.tracker.domain.service.LlmEvent
+import com.pennywiseai.tracker.domain.service.LlmService
 import com.pennywiseai.tracker.domain.service.isContextFull
 import com.pennywiseai.tracker.domain.service.isModelOutputError
-import kotlinx.coroutines.flow.emitAll
-import kotlinx.coroutines.flow.flow
-import kotlinx.coroutines.flow.mapNotNull
-import kotlinx.coroutines.flow.onEach
-import kotlinx.coroutines.flow.onCompletion
-import kotlinx.coroutines.flow.onStart
-import kotlinx.coroutines.flow.transform
-import com.pennywiseai.tracker.domain.service.LlmService
 import dagger.hilt.android.qualifiers.ApplicationContext
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.channels.awaitClose
-import kotlinx.coroutines.flow.callbackFlow
-import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.callbackFlow
 import kotlinx.coroutines.flow.catch
+import kotlinx.coroutines.flow.emitAll
+import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.flowOn
 import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.flow.mapNotNull
+import kotlinx.coroutines.flow.onCompletion
+import kotlinx.coroutines.flow.onEach
+import kotlinx.coroutines.flow.onStart
+import kotlinx.coroutines.flow.transform
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import javax.inject.Inject
 import javax.inject.Singleton
 
@@ -217,6 +218,90 @@ class LlmServiceImpl @Inject constructor(
                 chunk.toolCalls.forEach { emit(LlmEvent.ToolCall(it.name, it.arguments)) }
             }
             .flowOn(Dispatchers.IO)
+
+    override suspend fun askOneShot(systemPrompt: String, userPrompt: String, jsonSchema: String?): Result<String> =
+        withContext(Dispatchers.IO) { lifecycle.withLock {
+            try {
+                val currentEngine = engine ?: return@withLock Result.failure(
+                    IllegalStateException("Engine not initialized")
+                )
+                // A conversation that never drained may still run on this engine: nothing new beside it.
+                check(!undrained) { "A conversation never finished its prefill" }
+
+                // The chat's conversation goes: its history lives in Room and the next
+                // send rebuilds it (LlmRepository.ensureConversation).
+                takeConversation()?.closeSafely()
+
+                val config = ConversationConfig(
+                    systemInstruction = Contents.of(systemPrompt),
+                    prefillPrefaceOnInit = true,
+                    // Near-deterministic: this reply is parsed, not read.
+                    samplerConfig = SamplerConfig(topK = 1, topP = 1.0, temperature = 0.2),
+                    enableResponseFormat = jsonSchema != null,
+                    chatTemplate = QwenChatTemplate.TEMPLATE
+                )
+                conversationConfig = config
+                val oneShot = try {
+                    if (gpuUnconfirmed) backendPrefs.edit().putBoolean(KEY_GPU_FAILED, true).commit()
+                    currentEngine.createConversation(config).also {
+                        conversation = it
+                        if (gpuUnconfirmed) backendPrefs.edit().putBoolean(KEY_GPU_FAILED, false).commit()
+                    }
+                } catch (e: Exception) {
+                    // Same verdicts as createConversation: a full window says the GPU works.
+                    if (gpuUnconfirmed && e.isContextFull()) backendPrefs.edit().putBoolean(KEY_GPU_FAILED, false).commit()
+                    if (!gpuUnconfirmed || e.isContextFull()) throw e
+                    Log.w(TAG, "GPU failed to prefill the one-shot conversation (${e.javaClass.simpleName}), retrying on CPU")
+                    closeEngine()
+                    gpuUnconfirmed = false
+                    startEngine(modelPath ?: throw e, Backend.CPU()).also { engine = it }
+                        .createConversation(config).also { conversation = it }
+                }
+                try {
+                    var used = oneShot
+                    val message = try {
+                        sendOneShot(used, userPrompt, jsonSchema)
+                    } catch (e: Exception) {
+                        // A GPU that fails its first reply goes to CPU once (as in sendMessageEvents),
+                        // inlined: [lifecycle] is held here and its mutex is not reentrant.
+                        val path = modelPath
+                        if (e is CancellationException || !gpuUnconfirmed || e.isModelOutputError() ||
+                            conversation !== used || path == null
+                        ) throw e
+                        Log.w(TAG, "GPU failed its first one-shot reply (${e.javaClass.simpleName}), retrying on CPU")
+                        takeConversation()?.closeSafely()
+                        closeEngine()
+                        gpuUnconfirmed = false
+                        used = startEngine(path, Backend.CPU()).also { engine = it }
+                            .createConversation(config).also { conversation = it }
+                        sendOneShot(used, userPrompt, jsonSchema)
+                    }
+                    // This reply worked, so the GPU does too.
+                    if (gpuUnconfirmed) {
+                        gpuUnconfirmed = false
+                        backendPrefs.edit().putBoolean(KEY_GPU_FAILED, false).apply()
+                    }
+                    val text = message.contents.contents
+                        .filterIsInstance<com.google.ai.edge.litertlm.Content.Text>()
+                        .joinToString("") { it.text }
+                    Result.success(text)
+                } finally {
+                    // Whatever this turn runs on (the GPU original or its CPU rebuild) closes here.
+                    takeConversation()?.closeSafely()
+                }
+            } catch (e: Exception) {
+                Log.e(TAG, "One-shot reply failed (${e.javaClass.simpleName})")
+                Result.failure(e)
+            }
+        } }
+
+    /** One blocking reply on [conversation], constrained to [jsonSchema] when given. */
+    private suspend fun sendOneShot(conversation: Conversation, message: String, jsonSchema: String?): Message =
+        if (jsonSchema != null) {
+            conversation.sendMessage(message, responseFormat = ResponseFormat.json(jsonSchema))
+        } else {
+            conversation.sendMessage(message)
+        }
 
     /**
      * Starts the native reply and records when its prefill is over, for [closeSafely]. Both under

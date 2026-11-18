@@ -39,6 +39,15 @@ interface LlmService {
 
     fun sendMessage(message: String): Flow<String>
     fun sendMessageEvents(message: String): Flow<LlmEvent>
+
+    /**
+     * One ad-hoc turn in its own conversation: [systemPrompt], no chat history and
+     * no tools, its reply returned whole instead of streamed. The live conversation
+     * is closed first — the chat rebuilds its own from Room on the next send — and
+     * this one is closed before returning. [jsonSchema], when set, constrains the
+     * reply to that schema (constrained decoding). The engine must be initialized.
+     */
+    suspend fun askOneShot(systemPrompt: String, userPrompt: String, jsonSchema: String? = null): Result<String>
     fun hasActiveConversation(): Boolean
     suspend fun closeConversation()
     suspend fun reset()

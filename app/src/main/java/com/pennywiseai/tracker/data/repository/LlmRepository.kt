@@ -352,33 +352,59 @@ class LlmRepository @Inject constructor(
     }
 
     /**
+     * One ad-hoc structured turn for form prefill: its own conversation, nothing
+     * saved, closed before this returns — the next chat send rebuilds from Room.
+     * Holds [conversationLock] so a chat turn can't be mid-build underneath it.
+     * The caller checks the model is downloaded; [ensureEngine] still verifies
+     * the pinned hash before anything loads.
+     */
+    suspend fun extractOneShot(systemPrompt: String, userPrompt: String, jsonSchema: String): Result<String> =
+        conversationLock.withLock {
+            try {
+                ensureEngine()
+                llmService.askOneShot(systemPrompt, userPrompt, jsonSchema)
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                Log.w(TAG, "One-shot extraction failed (${e.javaClass.simpleName})")
+                Result.failure(e)
+            }
+        }
+
+    /**
+     * Loads the model's engine if it isn't running. Under [conversationLock]; the
+     * integrity gate never loads a model whose bytes don't match the pinned hash.
+     */
+    private suspend fun ensureEngine() {
+        if (llmService.isInitialized()) return
+
+        val modelFile = modelRepository.getModelFile()
+        if (!modelFile.exists()) {
+            throw Exception("Model not downloaded. Please download from Settings.")
+        }
+
+        val t0 = System.nanoTime()
+        if (!modelRepository.verifyModelIntegrity()) {
+            modelRepository.deleteModel()
+            throw Exception(INTEGRITY_FAILED)
+        }
+        val t1 = System.nanoTime()
+
+        val initResult = llmService.initialize(modelFile.absolutePath)
+        if (initResult.isFailure) {
+            throw initResult.exceptionOrNull() ?: Exception("Failed to initialize LLM")
+        }
+        Log.i(TIMING, "hash=${ms(t0, t1)}ms engine=${ms(t1)}ms")
+    }
+
+    /**
      * A live conversation with room for [incoming] and its reply, built from the saved chat if
      * needed. The message about to be sent is saved already, with no reply, so never replayed.
      * When the chat outgrows the model's window, its oldest turns leave the window (not the
      * screen) instead of the chat refusing to go on.
      */
     private suspend fun ensureConversation(incoming: String, shrink: Boolean = false) = conversationLock.withLock {
-        if (!llmService.isInitialized()) {
-            val modelFile = modelRepository.getModelFile()
-            if (!modelFile.exists()) {
-                throw Exception("Model not downloaded. Please download from Settings.")
-            }
-
-            val t0 = System.nanoTime()
-            // Integrity gate: never load a model whose bytes don't match the
-            // pinned hash (guards against an in-place-swapped or corrupted file).
-            if (!modelRepository.verifyModelIntegrity()) {
-                modelRepository.deleteModel()
-                throw Exception(INTEGRITY_FAILED)
-            }
-            val t1 = System.nanoTime()
-
-            val initResult = llmService.initialize(modelFile.absolutePath)
-            if (initResult.isFailure) {
-                throw initResult.exceptionOrNull() ?: Exception("Failed to initialize LLM")
-            }
-            Log.i(TIMING, "hash=${ms(t0, t1)}ms engine=${ms(t1)}ms")
-        }
+        ensureEngine()
 
         var outgrown = shrink
         if (llmService.hasActiveConversation()) {
